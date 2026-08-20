@@ -1,0 +1,4 @@
+# 将 Host 插件挂到 web profile；浏览器端由 dsh.client 自动注入。
+- insert:
+    - id: dsh-session-vault
+      name: 'dsh-session-vault'
