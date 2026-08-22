@@ -2,7 +2,7 @@
 
 [中文](README.md) · [English](README.en.md)
 
-一个面向 **DeepSeek Harness（DSH）`0.1.0-rc.7`** 的开源会话管理插件。它把活动会话、归档会话和回收站集中到一个设置页中，提供可恢复的删除流程，同时不注册模型工具、不修改 Router preset，也不注入网页 DOM。
+一个面向 **DeepSeek Harness（DSH）`0.1.1-rc.2`** 的开源会话管理插件。它把活动会话、归档会话和回收站集中到一个设置页中，提供可恢复的删除流程，同时不注册模型工具、不修改 Router preset，也不注入网页 DOM。
 
 > **默认语言：中文**　[切换到 English](README.en.md)
 
@@ -60,13 +60,13 @@
 
 | 项目 | 要求 |
 | --- | --- |
-| DSH | `0.1.0-rc.7` |
+| DSH | `0.1.0-rc.7` 及以上（已在 `0.1.1-rc.2` 上验证） |
 | Node.js | `22.19+` 或 `24+` |
 | Profile | `web` |
 | 存储后端 | DSH Web 默认的 JSON storage/domain 组合 |
 | 持久化后端 | 需要提供独立会话记录路径的 `sessionPersistence` |
 
-插件使用了 rc.7 的 `workspaceRegistry.requireState()` / `setState()` 状态原语来实现取消归档，因此不保证兼容更早版本。使用非标准会话持久化后端时，如果后端无法定位独立会话目录，插件会拒绝移动操作，而不是猜测或删除未知文件。
+插件使用了自 rc.7 引入的 `workspaceRegistry.requireState()` / `setState()` 状态原语来实现取消归档，因此不保证兼容更早版本。使用非标准会话持久化后端时，如果后端无法定位独立会话目录，插件会拒绝移动操作，而不是猜测或删除未知文件。
 
 ## 安装
 

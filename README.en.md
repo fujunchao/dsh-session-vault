@@ -2,7 +2,7 @@
 
 [中文](README.md) · [English](README.en.md)
 
-An open-source session-management plugin for **DeepSeek Harness (DSH) `0.1.0-rc.7`**. It brings active sessions, archived sessions, and a recoverable trash area into one settings page without registering model tools, changing Router presets, or injecting into the page DOM.
+An open-source session-management plugin for **DeepSeek Harness (DSH) `0.1.1-rc.2`**. It brings active sessions, archived sessions, and a recoverable trash area into one settings page without registering model tools, changing Router presets, or injecting into the page DOM.
 
 > **Default language: Chinese**　[切换到中文](README.md)
 
@@ -60,13 +60,13 @@ Permanent purge removes DSH session persistence and the related projection-cache
 
 | Component | Requirement |
 | --- | --- |
-| DSH | `0.1.0-rc.7` |
+| DSH | `0.1.0-rc.7` or newer (verified on `0.1.1-rc.2`) |
 | Node.js | `22.19+` or `24+` |
 | Profile | `web` |
 | Storage | DSH Web's default JSON storage/domain composition |
 | Persistence | A `sessionPersistence` provider that exposes an independent record path |
 
-Unarchive relies on the rc.7 `workspaceRegistry.requireState()` / `setState()` primitives, so older DSH releases are not supported. With a custom persistence backend that cannot locate an independent session directory, the plugin rejects the operation instead of guessing a path or deleting unknown files.
+Unarchive relies on the `workspaceRegistry.requireState()` / `setState()` primitives introduced in rc.7, so older DSH releases are not supported. With a custom persistence backend that cannot locate an independent session directory, the plugin rejects the operation instead of guessing a path or deleting unknown files.
 
 ## Installation
 
