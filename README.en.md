@@ -158,6 +158,8 @@ The search box matches:
 
 **Select all current results** is scoped to the current tab and filter; it does not accidentally select entries in another tab.
 
+The action bar is pinned to the bottom of the list and stays visible while scrolling, so a long list no longer has to be scrolled back down to act on a selection.
+
 ## Data and security
 
 ### File locations

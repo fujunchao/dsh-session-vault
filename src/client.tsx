@@ -85,7 +85,7 @@ const STYLE = `
 .dsv-badge { padding:3px 7px; border-radius:999px; background:rgba(49,91,255,.09); color:#315bff; font-size:10px; font-weight:650; }
 .dsv-badge--busy { background:rgba(240,68,56,.10); color:#d92d20; }
 .dsv-empty { padding:40px 20px; text-align:center; color:var(--dsw-alias-label-tertiary,#98a2b3); font-size:12px; }
-.dsv-footer { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.dsv-footer { position:sticky; bottom:0; z-index:3; display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:11px 12px; border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.16)); border-radius:14px; background:var(--dsw-alias-bg-base,rgba(255,255,255,.88)); backdrop-filter:blur(12px); box-shadow:0 6px 22px rgba(16,24,40,.10); }
 .dsv-spacer { flex:1; }
 @media (max-width:760px) { .dsv-hero { grid-template-columns:1fr; } .dsv-stats { justify-content:stretch; } .dsv-stat { flex:1; min-width:0; } .dsv-row { grid-template-columns:26px minmax(0,1fr); } .dsv-row-side { grid-column:2; justify-content:flex-start; } }
 @media (prefers-reduced-motion:reduce) { .dsv-root * { scroll-behavior:auto!important; transition:none!important; } }
@@ -225,7 +225,7 @@ function SessionVault({ sessions, workspaces }: Injected): ReactElement {
   return <div className="dsv-root">
     <section className="dsv-hero">
       <div>
-        <div className="dsv-kicker">DSH rc.7 · local session records</div>
+        <div className="dsv-kicker">DSH · local session records</div>
         <h2 className="dsv-title">会话保险库</h2>
         <div className="dsv-subtitle">归档用于隐藏，会话回收站用于可恢复删除。永久清除只处理 DSH 会话记录，不触碰工作区源码与产出文件。</div>
       </div>
