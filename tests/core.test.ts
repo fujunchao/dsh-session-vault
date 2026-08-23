@@ -6,6 +6,7 @@ import {
   isPathInside,
   isSessionId,
   normalizeIds,
+  selectOrphanedIds,
   sessionDirectoryFromArtifact,
 } from '../src/core.js'
 
@@ -61,5 +62,24 @@ describe('回收站状态', () => {
       { sessionId: 'session-a', trashPath: '/trash/a' },
       { sessionId: 'session-a', trashPath: '/trash/b' },
     ])).toThrow('重复会话')
+  })
+})
+
+describe('孤儿状态对账', () => {
+  it('只挑出现存会话之外的标识', () => {
+    const known = new Set(['session-a', 'session-b'])
+    expect(selectOrphanedIds(['session-a', 'session-x', 'session-b', 'session-y'], known))
+      .toEqual(['session-x', 'session-y'])
+  })
+
+  it('全部标识都有对应会话时不产生清理项', () => {
+    const known = new Set(['session-a', 'session-b'])
+    expect(selectOrphanedIds(['session-a', 'session-b'], known)).toEqual([])
+  })
+
+  it('空的会话集合会让全部标识成为孤儿——因此调用方必须保证列举成功', () => {
+    // 记录该边界语义：本函数不区分「确实没有会话」与「列举失败」，
+    // 后者必须由调用方在传入前抛出，绝不能退化成空集合传进来。
+    expect(selectOrphanedIds(['session-a'], new Set())).toEqual(['session-a'])
   })
 })

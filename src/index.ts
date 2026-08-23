@@ -28,6 +28,7 @@ import {
   isLoopbackRemoteAddress,
   isSessionId,
   normalizeIds,
+  selectOrphanedIds,
   sessionDirectoryFromArtifact,
 } from './core.js'
 
@@ -75,6 +76,7 @@ interface ProjectionCacheDomain {
   table(name: string): {
     get(key: string): ProjectionCacheRecord | undefined
     delete(key: string): Promise<boolean>
+    keys(): IterableIterator<string>
   }
 }
 
@@ -365,17 +367,61 @@ async function reconcilePendingPurges(
   }
 }
 
+/**
+ * 对账进程外被删除的会话留下的孤儿状态。
+ *
+ * 归档标记与投影缓存都以 sessionId 为键长期保存，而列表逻辑只正向遍历现存会话，
+ * 因此会话若不经由本插件删除（手动删除目录、外部工具等），这些键会静默堆积，
+ * 并且在界面上完全不可见。
+ *
+ * 安全约束：只信任一次成功的 `sessionPersistence.list()`。列举失败时向上抛出，
+ * 而不是退化成「读不到就删」——否则一次存储故障就会被误判为会话全部不存在，
+ * 进而清空用户的归档状态。
+ */
+async function reconcileOrphanedState(ctx: Context): Promise<void> {
+  const headers = await ctx.sessionPersistence.list()
+  const known = new Set<string>(headers.map((header) => String(header.id)))
+
+  const registry = workspaceInternals(ctx)
+  const state = registry.requireState()
+  const orphaned = selectOrphanedIds(state.archivedSessionIds, known)
+  if (orphaned.length > 0) {
+    const orphanedSet = new Set(orphaned)
+    await registry.setState({
+      ...state,
+      archivedSessionIds: state.archivedSessionIds.filter((id) => !orphanedSet.has(id)),
+    })
+    ctx.logger.info(`[dsh-session-vault] 已清理 ${orphaned.length} 个指向已删除会话的归档标记`)
+  }
+
+  const cache = projectionCache(ctx)?.table('sessions')
+  if (cache === undefined) return
+  const stale = selectOrphanedIds([...cache.keys()], known)
+  for (const key of stale) {
+    await cache.delete(key)
+  }
+  if (stale.length > 0) {
+    ctx.logger.info(`[dsh-session-vault] 已清理 ${stale.length} 条指向已删除会话的投影缓存`)
+  }
+}
+
 async function moveToTrash(ctx: Context, domain: { global: { get(): unknown; set(value: unknown): Promise<void> } }, sessionId: string): Promise<void> {
   const existing = entriesOf(domain)
   if (existing.some((entry) => entry.sessionId === sessionId)) return
 
   const header = await headerById(ctx, sessionId)
   const agent = ctx.agents.get(header.id)
-  if (agent !== undefined) {
-    throw Object.assign(new Error(agent.status === 'running' ? '会话正在运行，无法移入回收站' : '会话仍在当前 DSH 进程中打开，请重启服务后再删除'), {
-      code: agent.status === 'running' ? 'session-busy' : 'session-live',
+  if (agent?.status === 'running') {
+    throw Object.assign(new Error('会话正在运行，请先停止该会话后再移入回收站'), {
+      code: 'session-busy',
       status: 409,
     })
+  }
+  if (agent !== undefined) {
+    // 只要 Web UI 打开过该会话，进程内就会留下一个空闲 agent 实例，且 DSH 未提供
+    // 单独关闭它的接口。仅凭实例存在就拒绝删除会让会话在正常使用下几乎无法清理，
+    // 因此这里只拦截真正运行中的会话，空闲实例记录日志后放行。
+    ctx.logger.info(`[dsh-session-vault] 会话 ${sessionId} 仍在当前进程中打开但处于空闲状态，继续移入回收站`)
   }
 
   const location = ctx.sessionPersistence.locate(header)
@@ -520,6 +566,13 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
   const domain = await ctx.storageDomain.open(vaultDomainSpec)
   await mkdir(trashRoot(), { recursive: true })
   await reconcilePendingPurges(ctx, domain)
+  try {
+    await reconcileOrphanedState(ctx)
+  } catch (error) {
+    // 对账属于尽力而为的清理：读不到会话列表或当前 DSH 未暴露状态原语时保持原样，
+    // 留待下次启动重试，绝不因此让插件加载失败。
+    ctx.logger.warn('[dsh-session-vault] 孤儿状态对账未完成，将在下次启动重试', error)
+  }
 
   const unregister = ctx.webServer.register({
     kind: 'prefix',

@@ -56,6 +56,12 @@ Permanent purge removes DSH session persistence and the related projection-cache
 - No changes to Router Standard/Spec, model endpoints, search plugins, visual plugins, or skills;
 - Host API accepts only loopback, same-origin requests.
 
+### 8. Orphaned state reconciled at startup
+
+Archive flags and cached session titles are keyed by session id and kept indefinitely. When a session is removed outside this plugin (a manually deleted record directory, for example), those keys linger and stay completely invisible in the UI. On every startup the plugin reconciles them against one successful session listing and drops the keys whose sessions no longer exist.
+
+If that listing fails, reconciliation is skipped entirely and retried on the next startup. It never degrades into deleting whatever cannot be read, which would turn a single storage fault into a wiped archive state.
+
 ## Compatibility
 
 | Component | Requirement |
@@ -123,7 +129,7 @@ Archiving changes DSH visibility/workspace state only; it does not delete the re
 2. Click **Move to trash**;
 3. Wait for the operation to finish.
 
-Running sessions, sessions still open in the current DSH process, and sessions without a safely locatable persistence directory are never force-deleted. End the session or restart DSH before retrying.
+Running sessions and sessions without a safely locatable persistence directory are never force-deleted; end the session before retrying. A session that is merely open and idle in the Web UI can be deleted directly: DSH exposes no way to close an individual session instance, so refusing on that basis alone would make sessions nearly impossible to clean up in normal use.
 
 ### Restore a session
 
@@ -189,7 +195,7 @@ This is expected. The plugin is mounted through the profile's standard bundle, n
 
 ### A session cannot be moved to trash
 
-The session may still be running/open, or the persistence backend may not expose an independent directory. End the session and restart DSH, then retry. The plugin deliberately never guesses a path from a delete request.
+The session may still be running, or the persistence backend may not expose an independent directory. End the session, then retry. The plugin deliberately never guesses a path from a delete request. Note that a session merely being open in the Web UI no longer blocks deletion, so there is no need to restart DSH for that.
 
 ### `cannot get property "storageDomain" without inject`
 
