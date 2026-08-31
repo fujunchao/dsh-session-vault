@@ -56,11 +56,13 @@ Permanent purge removes DSH session persistence and the related projection-cache
 - No changes to Router Standard/Spec, model endpoints, search plugins, visual plugins, or skills;
 - Host API accepts only loopback, same-origin requests.
 
-### 8. Orphaned state reconciled at startup
+### 8. Orphaned state reconciled automatically
 
-Archive flags and cached session titles are keyed by session id and kept indefinitely. When a session is removed outside this plugin (a manually deleted record directory, for example), those keys linger and stay completely invisible in the UI. On every startup the plugin reconciles them against one successful session listing and drops the keys whose sessions no longer exist.
+Archive flags and cached session titles are keyed by session id and kept indefinitely. When a session is removed outside this plugin (a manually deleted record directory, for example), those keys linger and stay completely invisible in the UI. The typical symptom is an **Archived** count of 0 while a pile of archive flags remains, with archived sessions nowhere to be found in the vault.
 
-If that listing fails, reconciliation is skipped entirely and retried on the next startup. It never degrades into deleting whatever cannot be read, which would turn a single storage fault into a wiped archive state.
+The plugin reconciles those keys against one successful session listing **at startup and on every snapshot read**, dropping the ones whose sessions no longer exist. A session deleted externally while DSH is running is therefore cleaned up the next time the vault page is opened — no restart required.
+
+If that listing fails, reconciliation is skipped entirely and retried later. It never degrades into deleting whatever cannot be read, which would turn a single storage fault into a wiped archive state.
 
 ## Compatibility
 

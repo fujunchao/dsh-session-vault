@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-vault",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "面向 DSH rc.7 的安全会话管理插件：归档恢复、无限制回收站、批量操作与永久清除。",
   "author": "fujunchao",
   "repository": {

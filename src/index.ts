@@ -234,6 +234,17 @@ function workspaceTitle(ctx: Context, sessionId: string): string | undefined {
 
 async function listSnapshot(ctx: Context, domain: { global: { get(): unknown } }): Promise<SessionVaultSnapshot> {
   const headers = await ctx.sessionPersistence.list()
+  const known = new Set<string>(headers.map((header) => String(header.id)))
+
+  // 会话可能在本进程运行期间被外部删除（手动删目录、其它工具等），只在启动时对账
+  // 会让这些孤儿一直残留到下次重启，表现为「归档」计数为 0、归档标记却还剩一堆。
+  // 这里复用刚刚成功取得的会话列举顺带自愈；对账失败不影响快照本身。
+  try {
+    await reconcileOrphanedState(ctx, known)
+  } catch (error) {
+    ctx.logger.warn('[dsh-session-vault] 读取快照时的孤儿对账未完成', error)
+  }
+
   const archived = new Set(ctx.workspaceRegistry.archivedSessionIds.map(String))
   const cache = projectionCache(ctx)?.table('sessions')
   const rows: SessionVaultRow[] = []
@@ -372,15 +383,17 @@ async function reconcilePendingPurges(
  *
  * 归档标记与投影缓存都以 sessionId 为键长期保存，而列表逻辑只正向遍历现存会话，
  * 因此会话若不经由本插件删除（手动删除目录、外部工具等），这些键会静默堆积，
- * 并且在界面上完全不可见。
+ * 并且在界面上完全不可见——最典型的症状是「归档」计数为 0，归档标记却还剩一堆。
  *
- * 安全约束：只信任一次成功的 `sessionPersistence.list()`。列举失败时向上抛出，
- * 而不是退化成「读不到就删」——否则一次存储故障就会被误判为会话全部不存在，
- * 进而清空用户的归档状态。
+ * 安全约束：`known` 必须来自一次**成功**的会话列举，由调用方负责。列举失败时调用方
+ * 应直接放弃本轮对账，而不是传入空集合——否则一次存储故障就会被误判为会话全部不
+ * 存在，进而清空用户的归档状态。
+ *
+ * @param known 现存会话 id 集合，来自一次成功的 `sessionPersistence.list()`。
+ * @returns 本次清理掉的条目数；为 0 时不发生任何写入。
  */
-async function reconcileOrphanedState(ctx: Context): Promise<void> {
-  const headers = await ctx.sessionPersistence.list()
-  const known = new Set<string>(headers.map((header) => String(header.id)))
+async function reconcileOrphanedState(ctx: Context, known: ReadonlySet<string>): Promise<number> {
+  let removed = 0
 
   const registry = workspaceInternals(ctx)
   const state = registry.requireState()
@@ -391,11 +404,12 @@ async function reconcileOrphanedState(ctx: Context): Promise<void> {
       ...state,
       archivedSessionIds: state.archivedSessionIds.filter((id) => !orphanedSet.has(id)),
     })
+    removed += orphaned.length
     ctx.logger.info(`[dsh-session-vault] 已清理 ${orphaned.length} 个指向已删除会话的归档标记`)
   }
 
   const cache = projectionCache(ctx)?.table('sessions')
-  if (cache === undefined) return
+  if (cache === undefined) return removed
   const stale = selectOrphanedIds([...cache.keys()], known)
   for (const key of stale) {
     await cache.delete(key)
@@ -403,6 +417,7 @@ async function reconcileOrphanedState(ctx: Context): Promise<void> {
   if (stale.length > 0) {
     ctx.logger.info(`[dsh-session-vault] 已清理 ${stale.length} 条指向已删除会话的投影缓存`)
   }
+  return removed + stale.length
 }
 
 async function moveToTrash(ctx: Context, domain: { global: { get(): unknown; set(value: unknown): Promise<void> } }, sessionId: string): Promise<void> {
@@ -567,11 +582,12 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
   await mkdir(trashRoot(), { recursive: true })
   await reconcilePendingPurges(ctx, domain)
   try {
-    await reconcileOrphanedState(ctx)
+    const headers = await ctx.sessionPersistence.list()
+    await reconcileOrphanedState(ctx, new Set<string>(headers.map((header) => String(header.id))))
   } catch (error) {
     // 对账属于尽力而为的清理：读不到会话列表或当前 DSH 未暴露状态原语时保持原样，
-    // 留待下次启动重试，绝不因此让插件加载失败。
-    ctx.logger.warn('[dsh-session-vault] 孤儿状态对账未完成，将在下次启动重试', error)
+    // 留待下次读取快照或下次启动时重试，绝不因此让插件加载失败。
+    ctx.logger.warn('[dsh-session-vault] 启动时的孤儿对账未完成，稍后重试', error)
   }
 
   const unregister = ctx.webServer.register({
