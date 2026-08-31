@@ -44,6 +44,8 @@ The plugin never deletes old entries just because the trash reaches a fixed coun
 
 Permanent purge is available only for trash entries and requires an explicit confirmation. The Host uses a two-phase flow—stage, commit metadata, then remove files. If DSH exits in the middle, the next startup reconciles the staging directory and either restores or completes the pending operation.
 
+The removal step deletes the session record *before* clearing the archive flag and indexes. The reverse order leaves a window in which the record still exists on disk while already being detached from its workspace and no longer archived — exactly the profile of an ordinary ungrouped session, which makes it reappear in the sidebar.
+
 ### 6. Workspace files are left alone
 
 Permanent purge removes DSH session persistence and the related projection-cache row only. It does not remove workspace source code, downloads, build outputs, or other files created by the user.
@@ -63,6 +65,8 @@ Archive flags and cached session titles are keyed by session id and kept indefin
 The plugin reconciles those keys against one successful session listing **at startup and on every snapshot read**, dropping the ones whose sessions no longer exist. A session deleted externally while DSH is running is therefore cleaned up the next time the vault page is opened — no restart required.
 
 If that listing fails, reconciliation is skipped entirely and retried later. It never degrades into deleting whatever cannot be read, which would turn a single storage fault into a wiped archive state.
+
+Sessions sitting in the trash have been moved out of the sessions directory and therefore never appear in a listing, but they are managed by the plugin and remain restorable, so they are excluded from reconciliation. Without that exemption, the archive flag applied when a session is trashed would be wiped immediately and the session would pop back into the sidebar.
 
 ## Compatibility
 

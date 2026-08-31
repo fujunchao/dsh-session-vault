@@ -6,6 +6,7 @@ import {
   isPathInside,
   isSessionId,
   normalizeIds,
+  retainedSessionIds,
   selectOrphanedIds,
   sessionDirectoryFromArtifact,
 } from '../src/core.js'
@@ -81,5 +82,26 @@ describe('孤儿状态对账', () => {
     // 记录该边界语义：本函数不区分「确实没有会话」与「列举失败」，
     // 后者必须由调用方在传入前抛出，绝不能退化成空集合传进来。
     expect(selectOrphanedIds(['session-a'], new Set())).toEqual(['session-a'])
+  })
+})
+
+describe('回收站会话不得被当作孤儿', () => {
+  it('把回收站中的会话并入保留集合', () => {
+    const retained = retainedSessionIds(['session-a'], ['session-t'])
+    expect([...retained].sort()).toEqual(['session-a', 'session-t'])
+  })
+
+  it('移入回收站的会话不会被判为孤儿', () => {
+    // 回归防护：会话移入回收站后已不在 sessions 目录，若不并入保留集合，
+    // 对账会清掉用于遮蔽它的归档标记，导致它重新出现在侧边栏。
+    const existing = ['session-a']
+    const trashed = ['session-t']
+    const known = retainedSessionIds(existing, trashed)
+    expect(selectOrphanedIds(['session-a', 'session-t'], known)).toEqual([])
+  })
+
+  it('既不存在也不在回收站的标识仍会被清理', () => {
+    const known = retainedSessionIds(['session-a'], ['session-t'])
+    expect(selectOrphanedIds(['session-a', 'session-t', 'session-x'], known)).toEqual(['session-x'])
   })
 })

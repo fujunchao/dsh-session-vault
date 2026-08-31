@@ -28,6 +28,7 @@ import {
   isLoopbackRemoteAddress,
   isSessionId,
   normalizeIds,
+  retainedSessionIds,
   selectOrphanedIds,
   sessionDirectoryFromArtifact,
 } from './core.js'
@@ -240,7 +241,7 @@ async function listSnapshot(ctx: Context, domain: { global: { get(): unknown } }
   // 会让这些孤儿一直残留到下次重启，表现为「归档」计数为 0、归档标记却还剩一堆。
   // 这里复用刚刚成功取得的会话列举顺带自愈；对账失败不影响快照本身。
   try {
-    await reconcileOrphanedState(ctx, known)
+    await reconcileOrphanedState(ctx, known, domain)
   } catch (error) {
     ctx.logger.warn('[dsh-session-vault] 读取快照时的孤儿对账未完成', error)
   }
@@ -324,6 +325,15 @@ async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPat
     throw Object.assign(new Error('待清除目录未通过安全校验'), { code: 'unsafe-purging-path', status: 500 })
   }
 
+  // 顺序很重要：必须先物理删除，再解除归档遮蔽并清理索引。
+  //
+  // 反过来做会留下一个窗口——记录仍在磁盘上，却已经被移出工作区、也不再带归档标记，
+  // 此时它恰好符合「未分组的普通会话」的全部特征，会重新出现在侧边栏中。
+  //
+  // 先删文件则不存在该窗口：若后续状态清理中断，最坏只剩下指向已删除会话的孤儿标记，
+  // 而那正是 reconcileOrphanedState 每次读取快照时会自动收拾的东西。
+  await rm(stagedPath, { recursive: true, force: true, maxRetries: 3 })
+
   for (const workspace of ctx.workspaceRegistry.list()) {
     if (workspace.sessionIds.map(String).includes(sessionId)) {
       await workspace.detachSession(sessionId as SessionId)
@@ -332,7 +342,6 @@ async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPat
   await setArchived(ctx, sessionId, false)
   const cache = projectionCache(ctx)
   if (cache !== undefined) await cache.table('sessions').delete(sessionId)
-  await rm(stagedPath, { recursive: true, force: true, maxRetries: 3 })
 }
 
 async function reconcilePendingPurges(
@@ -385,14 +394,24 @@ async function reconcilePendingPurges(
  * 因此会话若不经由本插件删除（手动删除目录、外部工具等），这些键会静默堆积，
  * 并且在界面上完全不可见——最典型的症状是「归档」计数为 0，归档标记却还剩一堆。
  *
- * 安全约束：`known` 必须来自一次**成功**的会话列举，由调用方负责。列举失败时调用方
+ * 安全约束：`existing` 必须来自一次**成功**的会话列举，由调用方负责。列举失败时调用方
  * 应直接放弃本轮对账，而不是传入空集合——否则一次存储故障就会被误判为会话全部不
  * 存在，进而清空用户的归档状态。
  *
- * @param known 现存会话 id 集合，来自一次成功的 `sessionPersistence.list()`。
+ * 回收站中的会话已被移出 sessions 目录、不在列举结果内，但由本插件托管且可恢复，
+ * 因此在这里并入保留集合。漏掉它们会让「移入回收站」时设置的归档遮蔽被立刻清掉，
+ * 会话随即重新出现在侧边栏。
+ *
+ * @param existing 现存会话 id 集合，来自一次成功的 `sessionPersistence.list()`。
+ * @param domain 回收站元数据域，用于取得当前待恢复的会话。
  * @returns 本次清理掉的条目数；为 0 时不发生任何写入。
  */
-async function reconcileOrphanedState(ctx: Context, known: ReadonlySet<string>): Promise<number> {
+async function reconcileOrphanedState(
+  ctx: Context,
+  existing: ReadonlySet<string>,
+  domain: { global: { get(): unknown } },
+): Promise<number> {
+  const known = retainedSessionIds(existing, entriesOf(domain).map((entry) => entry.sessionId))
   let removed = 0
 
   const registry = workspaceInternals(ctx)
@@ -583,7 +602,7 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
   await reconcilePendingPurges(ctx, domain)
   try {
     const headers = await ctx.sessionPersistence.list()
-    await reconcileOrphanedState(ctx, new Set<string>(headers.map((header) => String(header.id))))
+    await reconcileOrphanedState(ctx, new Set<string>(headers.map((header) => String(header.id))), domain)
   } catch (error) {
     // 对账属于尽力而为的清理：读不到会话列表或当前 DSH 未暴露状态原语时保持原样，
     // 留待下次读取快照或下次启动时重试，绝不因此让插件加载失败。

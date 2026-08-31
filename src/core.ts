@@ -81,3 +81,16 @@ export function assertUniqueTrashPaths(entries: ReadonlyArray<{ sessionId: strin
 export function selectOrphanedIds(stored: readonly string[], known: ReadonlySet<string>): string[] {
   return stored.filter((id) => !known.has(id))
 }
+
+/**
+ * 计算仍受插件管辖、因而不得当作孤儿清理的会话标识。
+ *
+ * 回收站中的会话已被移出 DSH 的 sessions 目录，不会出现在会话列举结果里，但它们
+ * 由本插件托管且可随时恢复，并不是孤儿。移入回收站时插件会把会话标记为归档以遮蔽
+ * 它；若对账把这些标识判为孤儿清掉，该遮蔽立即失效，会话会重新冒到侧边栏中。
+ */
+export function retainedSessionIds(existing: Iterable<string>, trashed: Iterable<string>): Set<string> {
+  const retained = new Set<string>(existing)
+  for (const id of trashed) retained.add(id)
+  return retained
+}
