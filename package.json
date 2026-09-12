@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-vault",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "面向 DSH rc.7 的安全会话管理插件：归档恢复、无限制回收站、批量操作与永久清除。",
   "author": "fujunchao",
   "repository": {
@@ -44,7 +44,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --typecheck.enabled --typecheck.tsconfig tsconfig.test.json",
     "smoke": "node tests/bundle-smoke.mjs",
-    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm smoke"
+    "integration": "node --test tests/host-integration.mjs",
+    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm smoke && pnpm integration"
   },
   "dsh": {
     "bundle": {

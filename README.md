@@ -44,7 +44,9 @@
 
 永久清除只能针对回收站中的会话，界面会要求二次确认。Host 端采用“隔离 → 提交元数据 → 物理清理”的两阶段流程：如果进程在中途退出，下一次 DSH 启动时会自动尝试恢复或完成未结束的清理，避免只删文件或只删索引造成不一致。
 
-清理阶段先删除会话记录，再解除归档遮蔽并清理索引。顺序反过来会留下一个窗口——记录仍在磁盘上，却已被移出工作区且不再带归档标记，此时它恰好符合“未分组的普通会话”的全部特征，会重新出现在侧边栏中。
+清理阶段先释放宿主内存中的会话实例、删除会话记录，再解除归档遮蔽并清理索引。DSH 会合并磁盘记录和内存会话，单纯删除文件并不能让已加载的会话消失；若此时解除隐藏，它就会作为“未分组”会话重新出现。
+
+快照对账与清除共用串行队列，避免刷新读取到半完成的事务。释放失败时会保留隐藏状态和待重试目录，并返回 `purge-pending`，而不是显示清除成功；隔离目录直到全部清理完成才移除。
 
 ### 6. 不触碰工作区文件
 
@@ -67,6 +69,8 @@
 列举失败时对账会整体跳过并留到下次重试，绝不会退化成「读不到就删」——否则一次存储故障就会被放大成归档状态被清空。
 
 回收站中的会话虽然已被移出 sessions 目录、不会出现在列举结果里，但它们由插件托管且可随时恢复，因此不在对账清理范围内。漏掉这层保护会让「移入回收站」时设置的归档遮蔽被立即清掉，会话随即重新出现在侧边栏。
+
+宿主内存中仍存活的会话也属于保留范围，不能仅凭磁盘上没有记录就当作孤儿。这同样保护了释放失败、等待重试的已提交清除操作。
 
 ## 兼容性
 
@@ -219,6 +223,12 @@ sudo systemctl restart dsh-web.service
 
 不要手动删除 `purging/<session-id>`。重启 DSH 后插件会扫描隔离目录并自动完成或回滚未完成的事务；如仍失败，请保留日志并提交 Issue。
 
+### 清除回收站后出现“未分组”
+
+旧构建可能只删除磁盘记录，或在释放内存会话时因遗漏 `sessions` 依赖声明而报 `cannot get property "sessions" without inject`。刷新后的孤儿对账又移除归档标记，残留内存会话便会重新显示。
+
+更新插件后重新构建 `lib/` 并重启 DSH，让新入口元数据生效并释放旧进程中的残留会话。只刷新页面或只修改 TypeScript 源码不足以更新宿主插件。
+
 ## 开发与测试
 
 ```bash
@@ -233,7 +243,14 @@ pnpm check
 1. TypeScript 类型检查；
 2. Vitest 单元测试；
 3. Host/Client 构建；
-4. Host/Client bundle 入口冒烟测试。
+4. Host/Client bundle 入口冒烟测试；
+5. Host 集成回归测试（真实 Cordis 插件注入、SessionStore 和 HTTP 删除/恢复流程）。
+
+集成测试使用临时 `DSH_HOME`，不会清理真实会话。也可指定已安装的宿主环境，额外验证实际版本的会话查询合并逻辑：
+
+```bash
+DSH_TEST_HOST_ROOT="$HOME/.dsh/profiles/web" pnpm integration
+```
 
 源码目录：
 
@@ -252,7 +269,7 @@ lib/               发布和 DSH 运行时加载的构建产物
 
 本插件由两个标准入口组成：
 
-- **Host**：依赖 `webServer`、`sessionPersistence`、`workspaceRegistry`、`agents` 和 `storageDomain`，负责安全 API 与会话目录操作；
+- **Host**：依赖 `webServer`、`sessionPersistence`、`sessions`、`workspaceRegistry`、`agents` 和 `storageDomain`，负责安全 API、内存会话释放与会话目录操作；
 - **Client**：依赖 DSH 的 slots、locale、sessions、workspaces 服务，只注册一个 `settings.section` 设置区。
 
 它没有模型工具入口，也没有 Super Injector 专用注入入口。
@@ -262,4 +279,3 @@ lib/               发布和 DSH 运行时加载的构建产物
 [MIT License](LICENSE)
 
 欢迎提交 Issue 和 Pull Request。提交问题时请删除会话内容、API key、凭据和私人路径等敏感信息。
-

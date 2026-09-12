@@ -6,6 +6,7 @@ const host = await import(`../lib/index.js?smoke=${Date.now()}`)
 assert.equal(host.default.name, 'dsh-session-vault')
 assert.equal(host.default.apply, host.apply)
 assert.ok(host.default.inject.includes('storageDomain'))
+assert.ok(host.default.inject.includes('sessions'), '内存会话清理必须声明 sessions 服务依赖')
 
 let registration
 const clientCode = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')

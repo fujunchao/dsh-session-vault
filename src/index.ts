@@ -34,7 +34,7 @@ import {
 } from './core.js'
 
 export const name = 'dsh-session-vault'
-export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry', 'agents', 'storageDomain']
+export const inject = ['webServer', 'sessionPersistence', 'sessions', 'workspaceRegistry', 'agents', 'storageDomain']
 
 const MAX_BODY_BYTES = 256 * 1024
 const trashEntrySchema = z.object({
@@ -86,6 +86,21 @@ interface InternalWorkspaceRegistry {
   setState(state: WorkspaceState): Promise<void>
 }
 
+/** SessionStore 中单个存活会话的内部条目（dsh-session 的 SessionStore.enter 所安装）。 */
+interface LiveSessionStoreEntry {
+  id: string
+  appending?: boolean
+  announcing?: boolean
+  detachRequested?: boolean
+  detach?(): void
+}
+
+/** 进程内会话内存 store（ctx.sessions，服务名 "sessions"）上本插件用到的公开面。 */
+interface LiveSessionStore {
+  get(id: string): unknown
+  liveEntryFor(session: unknown): LiveSessionStoreEntry
+}
+
 function sessionsRoot(): string {
   return dshHomePath('sessions')
 }
@@ -115,6 +130,62 @@ function workspaceInternals(ctx: Context): InternalWorkspaceRegistry {
     })
   }
   return registry as InternalWorkspaceRegistry
+}
+
+function liveSessionStore(ctx: Context): LiveSessionStore | undefined {
+  const store = (ctx as unknown as { sessions?: Partial<LiveSessionStore> }).sessions
+  if (store === undefined || typeof store.get !== 'function' || typeof store.liveEntryFor !== 'function') {
+    return undefined
+  }
+  return store as LiveSessionStore
+}
+
+function assertPurgeIdle(ctx: Context, sessionId: string): void {
+  if (ctx.agents.get(sessionId as SessionId)?.status === 'running') {
+    throw Object.assign(new Error('会话正在运行，请先停止该会话后再永久清除'), {
+      code: 'session-busy', status: 409,
+    })
+  }
+}
+
+/**
+ * 把仍存活于宿主进程内存中的会话从 SessionStore 里驱逐。
+ *
+ * 背景：0.1.5 的会话列表（sessionQuery.listSessions）以 live 会话优先于持久化记录合并，
+ * 而本插件的「清除」只删除磁盘工件并解除工作区关联，进程内的会话对象（只要 Web UI
+ * 打开过该会话就会存在）并不会随之消失。此时该会话既无归档遮蔽、也无工作区归属，
+ * 恰好命中 UI「未分组」分组的全部特征——于是刚被清除的会话立刻全部回到侧边栏。
+ *
+ * DSH 没有公开的按 id 删除会话 API，这里通过 `get` / `liveEntryFor` 取得
+ * store 条目，再调用条目自带的 `detach` 闭包（移除 store 记录、解除 attachments
+ * 映射、发出 session/disposed）。对正在发布事件的会话采用与内部 detach 闭包一致的
+ * 延迟语义（置 detachRequested，由发布流程结束时自行落钩）。释放未完成时必须抛错，
+ * 由清除事务保留归档遮蔽和待重试目录，不能当成成功继续解除隐藏。
+ *
+ * @returns 是否驱逐了一个存活会话；会话本就不在内存中时返回 false（正常路径，
+ * 例如启动对账清理的会话从未被 UI 打开过）。
+ */
+function evictLiveSession(ctx: Context, sessionId: string): boolean {
+  assertPurgeIdle(ctx, sessionId)
+  const session = ctx.sessions.get(sessionId as SessionId)
+  if (session === undefined) return false
+  const store = liveSessionStore(ctx)
+  if (store === undefined) {
+    throw Object.assign(new Error('当前 DSH 版本不支持释放已加载的会话'), {
+      code: 'session-release-unsupported', status: 501,
+    })
+  }
+  const entry = store.liveEntryFor(session)
+  if (typeof entry.detach !== 'function') {
+    throw Object.assign(new Error('当前会话缺少释放方法'), { code: 'session-release-unsupported', status: 501 })
+  }
+  if (entry.appending === true || entry.announcing === true) entry.detachRequested = true
+  else entry.detach()
+  if (store.get(sessionId) !== undefined) {
+    throw Object.assign(new Error('会话尚未完成释放，保留隐藏状态等待重试'), { code: 'session-release-pending', status: 409 })
+  }
+  ctx.logger.info(`[dsh-session-vault] 已从内存中释放被清除的会话 ${sessionId}`)
+  return true
 }
 
 function projectionCache(ctx: Context): ProjectionCacheDomain | undefined {
@@ -233,8 +304,21 @@ function workspaceTitle(ctx: Context, sessionId: string): string | undefined {
   return undefined
 }
 
+/**
+ * 兼容 dsh 0.1.1 与 0.1.5 的 sessionPersistence.list() 返回结构：
+ * 0.1.5 起 list() 返回 { header, revision, sizeBytes? } 快照数组，
+ * 0.1.1 直接返回 header 数组。统一展开成 header 列表。
+ */
+function persistenceHeaders(snapshots: readonly unknown[]): SessionHeader[] {
+  return (Array.isArray(snapshots) ? snapshots : []).map((entry) =>
+    entry !== null && typeof entry === 'object' && 'header' in entry
+      ? (entry as { header: SessionHeader }).header
+      : (entry as SessionHeader),
+  )
+}
+
 async function listSnapshot(ctx: Context, domain: { global: { get(): unknown } }): Promise<SessionVaultSnapshot> {
-  const headers = await ctx.sessionPersistence.list()
+  const headers = persistenceHeaders(await ctx.sessionPersistence.list())
   const known = new Set<string>(headers.map((header) => String(header.id)))
 
   // 会话可能在本进程运行期间被外部删除（手动删目录、其它工具等），只在启动时对账
@@ -292,7 +376,7 @@ async function listSnapshot(ctx: Context, domain: { global: { get(): unknown } }
 }
 
 async function headerById(ctx: Context, sessionId: string): Promise<SessionHeader> {
-  const header = (await ctx.sessionPersistence.list()).find((candidate) => String(candidate.id) === sessionId)
+  const header = persistenceHeaders(await ctx.sessionPersistence.list()).find((candidate) => String(candidate.id) === sessionId)
   if (header === undefined) {
     throw Object.assign(new Error('找不到该会话记录'), { code: 'session-not-found', status: 404 })
   }
@@ -325,14 +409,14 @@ async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPat
     throw Object.assign(new Error('待清除目录未通过安全校验'), { code: 'unsafe-purging-path', status: 500 })
   }
 
-  // 顺序很重要：必须先物理删除，再解除归档遮蔽并清理索引。
-  //
-  // 反过来做会留下一个窗口——记录仍在磁盘上，却已经被移出工作区、也不再带归档标记，
-  // 此时它恰好符合「未分组的普通会话」的全部特征，会重新出现在侧边栏中。
-  //
-  // 先删文件则不存在该窗口：若后续状态清理中断，最坏只剩下指向已删除会话的孤儿标记，
-  // 而那正是 reconcileOrphanedState 每次读取快照时会自动收拾的东西。
-  await rm(stagedPath, { recursive: true, force: true, maxRetries: 3 })
+  // 磁盘记录与内存实例都消失后才能解除归档遮蔽，否则宿主合并会话列表时
+  // 仍会把已移出工作区的 live 会话显示到「未分组」。释放失败不得继续清理。
+  // 保留空的隔离目录作为重试标记，直到文件、工作区和缓存全部处理完成。
+  await mkdir(stagedPath, { recursive: true })
+  evictLiveSession(ctx, sessionId)
+  for (const child of await readdir(stagedPath)) {
+    await rm(join(stagedPath, child), { recursive: true, force: true, maxRetries: 3 })
+  }
 
   for (const workspace of ctx.workspaceRegistry.list()) {
     if (workspace.sessionIds.map(String).includes(sessionId)) {
@@ -342,6 +426,7 @@ async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPat
   await setArchived(ctx, sessionId, false)
   const cache = projectionCache(ctx)
   if (cache !== undefined) await cache.table('sessions').delete(sessionId)
+  await rm(stagedPath, { recursive: true, force: true, maxRetries: 3 })
 }
 
 async function reconcilePendingPurges(
@@ -399,8 +484,8 @@ async function reconcilePendingPurges(
  * 存在，进而清空用户的归档状态。
  *
  * 回收站中的会话已被移出 sessions 目录、不在列举结果内，但由本插件托管且可恢复，
- * 因此在这里并入保留集合。漏掉它们会让「移入回收站」时设置的归档遮蔽被立刻清掉，
- * 会话随即重新出现在侧边栏。
+ * 因此在这里并入保留集合。宿主内存中仍存活的会话也必须保留：列举磁盘文件无法
+ * 证明它们已经消失，尤其是释放失败、等待重试的清除操作不能被对账提前解除隐藏。
  *
  * @param existing 现存会话 id 集合，来自一次成功的 `sessionPersistence.list()`。
  * @param domain 回收站元数据域，用于取得当前待恢复的会话。
@@ -411,7 +496,10 @@ async function reconcileOrphanedState(
   existing: ReadonlySet<string>,
   domain: { global: { get(): unknown } },
 ): Promise<number> {
-  const known = retainedSessionIds(existing, entriesOf(domain).map((entry) => entry.sessionId))
+  const known = retainedSessionIds(existing, [
+    ...entriesOf(domain).map((entry) => entry.sessionId),
+    ...ctx.sessions.list().map((session) => String(session.id)),
+  ])
   let removed = 0
 
   const registry = workspaceInternals(ctx)
@@ -542,6 +630,7 @@ async function purgeTrash(ctx: Context, domain: { global: { get(): unknown; set(
   if (entry === undefined) {
     throw Object.assign(new Error('回收站中没有该会话'), { code: 'trash-not-found', status: 404 })
   }
+  assertPurgeIdle(ctx, sessionId)
   if (!isPathInside(trashRoot(), entry.trashPath)) {
     throw Object.assign(new Error('回收站记录路径未通过安全校验'), { code: 'unsafe-trash-path', status: 500 })
   }
@@ -573,6 +662,9 @@ async function purgeTrash(ctx: Context, domain: { global: { get(): unknown; set(
     await finalizeCommittedPurge(ctx, sessionId, stagedPath)
   } catch (error) {
     ctx.logger.warn(`[dsh-session-vault] 会话已从回收站提交清除，但物理清理尚未完成，将在下次启动重试：${sessionId}`, error)
+    throw Object.assign(new Error('会话已提交清除，但剩余清理未完成；请重启 DSH 自动重试', { cause: error }), {
+      code: 'purge-pending', status: 503,
+    })
   }
 }
 
@@ -601,7 +693,7 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
   await mkdir(trashRoot(), { recursive: true })
   await reconcilePendingPurges(ctx, domain)
   try {
-    const headers = await ctx.sessionPersistence.list()
+    const headers = persistenceHeaders(await ctx.sessionPersistence.list())
     await reconcileOrphanedState(ctx, new Set<string>(headers.map((header) => String(header.id))), domain)
   } catch (error) {
     // 对账属于尽力而为的清理：读不到会话列表或当前 DSH 未暴露状态原语时保持原样，
@@ -617,7 +709,8 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
       const pathname = new URL(req.url ?? '/', 'http://dsh.local').pathname
       const method = pathname.startsWith(`${API_PREFIX}/`) ? pathname.slice(API_PREFIX.length + 1) : ''
       try {
-        if (req.method === 'GET' && method === 'snapshot') return writeOk(res, await listSnapshot(ctx, domain))
+        // 快照包含会修改归档标记的对账，必须与清除共用队列，避免读取半完成事务。
+        if (req.method === 'GET' && method === 'snapshot') return writeOk(res, await mutate(() => listSnapshot(ctx, domain)))
         if (req.method !== 'POST') {
           return writeJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: '请求方法不受支持' } })
         }

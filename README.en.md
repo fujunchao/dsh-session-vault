@@ -44,7 +44,9 @@ The plugin never deletes old entries just because the trash reaches a fixed coun
 
 Permanent purge is available only for trash entries and requires an explicit confirmation. The Host uses a two-phase flow—stage, commit metadata, then remove files. If DSH exits in the middle, the next startup reconciles the staging directory and either restores or completes the pending operation.
 
-The removal step deletes the session record *before* clearing the archive flag and indexes. The reverse order leaves a window in which the record still exists on disk while already being detached from its workspace and no longer archived — exactly the profile of an ordinary ungrouped session, which makes it reappear in the sidebar.
+The removal step releases the live session and deletes its records *before* clearing the archive flag and indexes. DSH merges persisted and in-memory sessions: deleting files alone does not remove an already loaded session, which would reappear as an ungrouped session when its archive flag is cleared.
+
+Snapshot reconciliation and mutations share a serial queue, so a refresh cannot observe a half-finished transaction. If releasing the session fails, the archive flag and retry directory are retained and the operation reports `purge-pending` rather than success. The staging directory is removed only after every cleanup step finishes.
 
 ### 6. Workspace files are left alone
 
@@ -67,6 +69,8 @@ The plugin reconciles those keys against one successful session listing **at sta
 If that listing fails, reconciliation is skipped entirely and retried later. It never degrades into deleting whatever cannot be read, which would turn a single storage fault into a wiped archive state.
 
 Sessions sitting in the trash have been moved out of the sessions directory and therefore never appear in a listing, but they are managed by the plugin and remain restorable, so they are excluded from reconciliation. Without that exemption, the archive flag applied when a session is trashed would be wiped immediately and the session would pop back into the sidebar.
+
+Live sessions are also retained: absence from disk alone does not prove that a session is gone. This protects committed purges whose in-memory cleanup failed and is waiting for a retry.
 
 ## Compatibility
 
@@ -219,6 +223,12 @@ sudo systemctl restart dsh-web.service
 
 Do not remove `purging/<session-id>` by hand. On the next DSH startup the plugin scans the staging directory and completes or rolls back the unfinished transaction. If it still fails, preserve the logs and open an Issue.
 
+### Purged sessions reappear under Ungrouped
+
+Older builds could delete only the files, or fail to release the live session with `cannot get property "sessions" without inject` because the service dependency was not declared. Snapshot reconciliation then cleared its archive flag, exposing the remaining in-memory session.
+
+After updating, rebuild `lib/` and restart DSH to load the new entry metadata and release leftovers from the previous process. Refreshing the page or changing only the TypeScript source does not update the Host plugin.
+
 ## Development and testing
 
 ```bash
@@ -233,7 +243,14 @@ pnpm check
 1. TypeScript type checking;
 2. Vitest unit tests;
 3. Host/Client builds;
-4. Host/Client bundle smoke tests.
+4. Host/Client bundle smoke tests;
+5. Host integration regressions using real Cordis plugin injection, SessionStore, and HTTP purge/restore flows.
+
+Integration tests use a temporary `DSH_HOME` and never purge real sessions. To additionally exercise the installed host's actual session-query implementation:
+
+```bash
+DSH_TEST_HOST_ROOT="$HOME/.dsh/profiles/web" pnpm integration
+```
 
 Source layout:
 
@@ -252,7 +269,7 @@ Run the build after changing the TypeScript sources. DSH loads the built `lib/` 
 
 The plugin has two standard entry points:
 
-- **Host**: injects `webServer`, `sessionPersistence`, `workspaceRegistry`, `agents`, and `storageDomain` for the API and safe session-directory operations;
+- **Host**: injects `webServer`, `sessionPersistence`, `sessions`, `workspaceRegistry`, `agents`, and `storageDomain` for the API, live-session release, and safe session-directory operations;
 - **Client**: injects DSH slots, locale, sessions, and workspaces, and registers exactly one `settings.section`.
 
 There is no model-tool entry point and no Super Injector-specific entry point.
@@ -262,4 +279,3 @@ There is no model-tool entry point and no Super Injector-specific entry point.
 [MIT License](LICENSE)
 
 Issues and pull requests are welcome. Remove conversation content, API keys, credentials, and private paths before sharing diagnostics.
-
