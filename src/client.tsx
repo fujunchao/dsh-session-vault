@@ -1,13 +1,14 @@
-import type { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-import type { ISessions, IWorkspaces, SessionListState, WorkspaceListState } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ISessions, SessionListState } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { IWorkspaces, WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import { Button, Input, Pill, RiskConfirmation } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
-  IconArchiveOutline20,
-  IconRefreshOutline16,
-  IconSearchOutline16,
-  IconTrashOutline16,
+  IconArchiveOutlineMedium,
+  IconRefreshOutlineRegular,
+  IconSearchOutlineRegular,
+  IconTrashOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type ReactElement } from 'react'
 import {
@@ -137,7 +138,7 @@ function useSnapshotStore<T>(store: { getSnapshot(): T; subscribe(listener: () =
 
 function SessionVault({ sessions, workspaces }: Injected): ReactElement {
   const sessionState = useSnapshotStore<SessionListState>(sessions.list)
-  const workspaceState = useSnapshotStore<WorkspaceListState>(workspaces.list)
+  const workspaceState = useSnapshotStore<WorkspaceSnapshot>(workspaces.list)
   const [snapshot, setSnapshot] = useState<SessionVaultSnapshot | null>(null)
   const [tab, setTab] = useState<Tab>('archived')
   const [query, setQuery] = useState('')
@@ -242,8 +243,8 @@ function SessionVault({ sessions, workspaces }: Injected): ReactElement {
         <Pill active={tab === 'archived'} onClick={() => setTab('archived')}>归档</Pill>
         <Pill active={tab === 'trash'} onClick={() => setTab('trash')}>回收站</Pill>
       </div>
-      <Input className="dsv-search" icon={<IconSearchOutline16 />} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、会话 ID 或路径" />
-      <Button size="sm" variant="outline" icon={<IconRefreshOutline16 />} onClick={() => void refresh()} disabled={loading || busy}>{loading ? '刷新中' : '刷新'}</Button>
+      <Input className="dsv-search" icon={<IconSearchOutlineRegular />} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、会话 ID 或路径" />
+      <Button size="sm" variant="outline" icon={<IconRefreshOutlineRegular />} onClick={() => void refresh()} disabled={loading || busy}>{loading ? '刷新中' : '刷新'}</Button>
     </div>
 
     {notice !== null && <div className={`dsv-notice ${notice.ok ? 'dsv-notice--ok' : 'dsv-notice--bad'}`}>{notice.text}</div>}
@@ -278,16 +279,16 @@ function SessionVault({ sessions, workspaces }: Injected): ReactElement {
       <span className="dsv-selected">已选 {selected.size} 项</span>
       <span className="dsv-spacer" />
       {tab === 'active' && <>
-        <Button size="sm" variant="outline" icon={<IconArchiveOutline20 size={16} />} disabled={selected.size === 0 || busy} onClick={() => requestAction('archive')}>归档</Button>
-        <Button size="sm" variant="outline" icon={<IconTrashOutline16 />} disabled={selected.size === 0 || busy} onClick={() => requestAction('trash')}>移入回收站</Button>
+        <Button size="sm" variant="outline" icon={<IconArchiveOutlineMedium size={16} />} disabled={selected.size === 0 || busy} onClick={() => requestAction('archive')}>归档</Button>
+        <Button size="sm" variant="outline" icon={<IconTrashOutlineRegular />} disabled={selected.size === 0 || busy} onClick={() => requestAction('trash')}>移入回收站</Button>
       </>}
       {tab === 'archived' && <>
         <Button size="sm" variant="outline" disabled={selected.size === 0 || busy} onClick={() => requestAction('unarchive')}>移出归档</Button>
-        <Button size="sm" variant="outline" icon={<IconTrashOutline16 />} disabled={selected.size === 0 || busy} onClick={() => requestAction('trash')}>移入回收站</Button>
+        <Button size="sm" variant="outline" icon={<IconTrashOutlineRegular />} disabled={selected.size === 0 || busy} onClick={() => requestAction('trash')}>移入回收站</Button>
       </>}
       {tab === 'trash' && <>
         <Button size="sm" variant="outline" disabled={selected.size === 0 || busy} onClick={() => requestAction('restore')}>恢复</Button>
-        <Button size="sm" variant="outline" icon={<IconTrashOutline16 />} disabled={selected.size === 0 || busy} onClick={() => requestAction('purge')}>永久清除</Button>
+        <Button size="sm" variant="outline" icon={<IconTrashOutlineRegular />} disabled={selected.size === 0 || busy} onClick={() => requestAction('purge')}>永久清除</Button>
       </>}
     </div>
 
@@ -297,6 +298,7 @@ function SessionVault({ sessions, workspaces }: Injected): ReactElement {
       description="这些 DSH 会话记录将从回收站中物理删除，且无法恢复。工作区源码与产出文件不会被删除。"
       acknowledgeLabel="我确认只清除已列出的 DSH 会话记录"
       cancelLabel="取消"
+      closeLabel="关闭"
       confirmLabel={busy ? '清除中…' : '永久清除'}
       acknowledged={acknowledged}
       disabled={busy}

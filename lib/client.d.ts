@@ -1,5 +1,6 @@
-import type { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client';
-import type { ISessions, IWorkspaces } from '@deepseek-ai/dsh-client-runtime/client';
+import type { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client';
+import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client';
+import type { IWorkspaces } from '@deepseek-ai/dsh-api-workspace-controller/client';
 export declare const name = "dsh-session-vault/client";
 export declare const inject: string[];
 declare const NS = "dsh-session-vault";

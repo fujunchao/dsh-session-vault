@@ -26,7 +26,9 @@ import {
   isPathInside,
   isLoopbackHost,
   isLoopbackRemoteAddress,
+  ensureDirectoryAbsent,
   isSessionId,
+  locateSessionArtifact,
   normalizeIds,
   retainedSessionIds,
   selectOrphanedIds,
@@ -337,12 +339,12 @@ async function listSnapshot(ctx: Context, domain: { global: { get(): unknown } }
   for (const header of headers) {
     const sessionId = String(header.id)
     const record = cache?.get(sessionId)
-    const location = ctx.sessionPersistence.locate(header)
+    const artifact = locateSessionArtifact(sessionsRoot(), sessionId)
     let sizeBytes = 0
     let updatedAt = record?.identity?.createdAt ?? header.createdAt
-    if (location?.path !== undefined) {
+    if (artifact !== undefined) {
       try {
-        const info = await stat(location.path)
+        const info = await stat(artifact)
         sizeBytes = info.size
         updatedAt = info.mtimeMs
       } catch {
@@ -404,7 +406,7 @@ async function setArchived(ctx: Context, sessionId: string, archived: boolean): 
   })
 }
 
-async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPath: string): Promise<void> {
+async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPath: string, originalDir: string | undefined): Promise<void> {
   if (!isPathInside(purgingRoot(), stagedPath)) {
     throw Object.assign(new Error('待清除目录未通过安全校验'), { code: 'unsafe-purging-path', status: 500 })
   }
@@ -416,6 +418,13 @@ async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPat
   evictLiveSession(ctx, sessionId)
   for (const child of await readdir(stagedPath)) {
     await rm(join(stagedPath, child), { recursive: true, force: true, maxRetries: 3 })
+  }
+
+  // 会话写入器按 header（cwd+id）推导路径且关闭时补落盘：回收站期间若有
+  // 在途 flush 把记录写回了原位，此处必须等到原位副本确实消失，才能解除
+  // 归档遮蔽；否则清除完成后「未分组」里会出现同名会话（复活）。
+  if (originalDir !== undefined && isPathInside(sessionsRoot(), originalDir)) {
+    await ensureDirectoryAbsent(originalDir)
   }
 
   for (const workspace of ctx.workspaceRegistry.list()) {
@@ -465,7 +474,14 @@ async function reconcilePendingPurges(
     }
 
     try {
-      await finalizeCommittedPurge(ctx, child.name, stagedPath)
+      // 重试时回收站条目已删除，改为按会话 ID 重新扫描原位（含写入器重建的副本）。
+      const resurrected = locateSessionArtifact(sessionsRoot(), child.name)
+      await finalizeCommittedPurge(
+        ctx,
+        child.name,
+        stagedPath,
+        resurrected === undefined ? undefined : sessionDirectoryFromArtifact(sessionsRoot(), resurrected),
+      )
     } catch (error) {
       ctx.logger.warn(`[dsh-session-vault] 完成已提交的清除操作失败，将在下次启动重试：${child.name}`, error)
     }
@@ -546,14 +562,14 @@ async function moveToTrash(ctx: Context, domain: { global: { get(): unknown; set
     ctx.logger.info(`[dsh-session-vault] 会话 ${sessionId} 仍在当前进程中打开但处于空闲状态，继续移入回收站`)
   }
 
-  const location = ctx.sessionPersistence.locate(header)
-  if (location === undefined) {
+  const artifact = locateSessionArtifact(sessionsRoot(), sessionId)
+  if (artifact === undefined) {
     throw Object.assign(new Error('当前持久化后端没有独立会话记录，无法安全移动'), {
       code: 'artifact-unavailable',
       status: 501,
     })
   }
-  const originalPath = sessionDirectoryFromArtifact(sessionsRoot(), location.path)
+  const originalPath = sessionDirectoryFromArtifact(sessionsRoot(), artifact)
   if (!existsSync(originalPath)) {
     throw Object.assign(new Error('会话记录目录不存在'), { code: 'artifact-not-found', status: 404 })
   }
@@ -586,6 +602,13 @@ async function moveToTrash(ctx: Context, domain: { global: { get(): unknown; set
     await rename(originalPath, trashPath)
     moved = true
     await saveEntries(domain, [...existing, entry])
+    // 写入器的 200ms 批量落盘窗口可能在 rename 后把记录写回原位；尽力清理，
+    // 残留副本交由永久清除的原位守卫兜底（此处失败不影响回收站事务）。
+    try {
+      await ensureDirectoryAbsent(originalPath, { attempts: 3, intervalMs: 250 })
+    } catch (resurrected) {
+      ctx.logger.warn(`[dsh-session-vault] 会话 ${sessionId} 移入回收站后原位出现写入器重建副本，将在永久清除时一并处理`, resurrected)
+    }
   } catch (error) {
     if (moved && existsSync(trashPath) && !existsSync(originalPath)) {
       await mkdir(dirname(originalPath), { recursive: true }).catch(() => {})
@@ -659,7 +682,7 @@ async function purgeTrash(ctx: Context, domain: { global: { get(): unknown; set(
   }
 
   try {
-    await finalizeCommittedPurge(ctx, sessionId, stagedPath)
+    await finalizeCommittedPurge(ctx, sessionId, stagedPath, entry.originalPath)
   } catch (error) {
     ctx.logger.warn(`[dsh-session-vault] 会话已从回收站提交清除，但物理清理尚未完成，将在下次启动重试：${sessionId}`, error)
     throw Object.assign(new Error('会话已提交清除，但剩余清理未完成；请重启 DSH 自动重试', { cause: error }), {

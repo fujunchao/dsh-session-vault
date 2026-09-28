@@ -3,6 +3,32 @@ export declare function isLoopbackHost(value: string): boolean;
 export declare function isLoopbackRemoteAddress(value: string | undefined): boolean;
 export declare function isSessionId(value: unknown): value is string;
 export declare function isPathInside(root: string, candidate: string): boolean;
+/** 等待并保证一个目录最终从磁盘上消失（有界重试）。 *
+ * DSH 0.1.7 的会话写入器以 header（cwd+id）推导落盘路径，事件批量窗口约
+ * 200ms，且句柄关闭（session/disposed / 进程 teardown）时还会补一次
+ * drain+flush。把会话目录移出 sessions 根之后，任何在途写入都会按推导路径
+ * 把目录重新 materialize 回原位——回收站里留着一份，原位又复活一份；随后
+ * 永久清除会解除归档遮蔽，这份复活副本就会以「未分组」形式回到侧边栏。
+ *
+ * 本守卫在移动/删除之后轮询原位：先给在途 flush 一个落定的宽限期，若目录
+ * 仍被重建则物理清除并继续观察，直到连续 attempts 次确认不存在为止。全部
+ * 重试耗尽仍存在时抛错（code='artifact-resurrected'），调用方保留归档
+ * 遮蔽并走既有重试路径，绝不能在原位仍有副本时解除隐藏。
+ */
+export declare function ensureDirectoryAbsent(path: string, { attempts, intervalMs }?: {
+    attempts?: number;
+    intervalMs?: number;
+}): Promise<void>;
+/**
+ * 在 DSH sessions 根目录下按会话 ID 定位其记录文件。
+ *
+ * DSH 0.1.7 起 sessionPersistence 服务不再暴露 locate()/物理路径（快照只给
+ * sizeBytes 等派生信息）。会话记录实际存放在
+ * `<sessionsRoot>/<工作目录编码>/<sessionId>/session.*`，本插件需要物理
+ * 移动文件（移入回收站/恢复/清除），因此这里自行扫描定位；找不到时返回
+ * undefined，与旧 locate() 对内存型后端的语义一致。
+ */
+export declare function locateSessionArtifact(sessionsRoot: string, sessionId: string): string | undefined;
 export declare function sessionDirectoryFromArtifact(sessionsRoot: string, artifactPath: string): string;
 export declare function normalizeIds(value: unknown): string[];
 export declare function formatFailure(error: unknown): {

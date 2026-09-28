@@ -1,9 +1,14 @@
-import { describe, expect, it } from 'vitest'
+import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   assertUniqueTrashPaths,
   isLoopbackHost,
   isLoopbackRemoteAddress,
   isPathInside,
+  ensureDirectoryAbsent,
   isSessionId,
   normalizeIds,
   retainedSessionIds,
@@ -103,5 +108,54 @@ describe('回收站会话不得被当作孤儿', () => {
   it('既不存在也不在回收站的标识仍会被清理', () => {
     const known = retainedSessionIds(['session-a'], ['session-t'])
     expect(selectOrphanedIds(['session-a', 'session-t', 'session-x'], known)).toEqual(['session-x'])
+  })
+})
+
+
+describe('ensureDirectoryAbsent 原位守卫', () => {
+  const leftovers: string[] = []
+
+  afterEach(async () => {
+    await Promise.all(leftovers.splice(0).map((dir) => rm(dir, { recursive: true, force: true }).catch(() => {})))
+  })
+
+  it('目录不存在时立即通过', async () => {
+    const path = join(tmpdir(), 'dsv-absent-guard', 'no-such-session')
+    await expect(ensureDirectoryAbsent(path, { attempts: 2, intervalMs: 5 })).resolves.toBeUndefined()
+  })
+
+  it('已存在的目录会被清除并确认消失', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsv-guard-'))
+    leftovers.push(root)
+    const dir = join(root, 'session-stale')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'x')
+    await expect(ensureDirectoryAbsent(dir, { attempts: 3, intervalMs: 10 })).resolves.toBeUndefined()
+    expect(existsSync(dir)).toBe(false)
+  })
+
+  it('宽限后被重建一次的目录仍会被清掉', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsv-guard-late-'))
+    leftovers.push(root)
+    const dir = join(root, 'session-late')
+    await mkdir(dir, { recursive: true })
+    // 首轮清除完成后 ~1 个间隔再重建一次（模拟迟到的 flush），守卫应继续观察到并清除。
+    setTimeout(() => { void mkdir(dir, { recursive: true }).catch(() => {}) }, 40)
+    await expect(ensureDirectoryAbsent(dir, { attempts: 5, intervalMs: 30 })).resolves.toBeUndefined()
+    expect(existsSync(dir)).toBe(false)
+  })
+
+  it('持续被重建时抛 artifact-resurrected', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsv-guard-ghost-'))
+    leftovers.push(root)
+    const dir = join(root, 'session-ghost')
+    await mkdir(dir, { recursive: true })
+    // 每 25ms 重建一次，模拟持续写入器；守卫耗尽重试后必须抛错，绝不误报成功。
+    const recreator = setInterval(() => { void mkdir(dir, { recursive: true }).catch(() => {}) }, 25)
+    try {
+      await expect(ensureDirectoryAbsent(dir, { attempts: 3, intervalMs: 30 })).rejects.toMatchObject({ code: 'artifact-resurrected' })
+    } finally {
+      clearInterval(recreator)
+    }
   })
 })
