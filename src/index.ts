@@ -16,6 +16,7 @@ import {
   API_PREFIX,
   type BatchAction,
   type BatchResult,
+  type PurgedTombstone,
   type SessionVaultRow,
   type SessionVaultSnapshot,
   type TrashEntry,
@@ -30,15 +31,21 @@ import {
   isSessionId,
   locateSessionArtifact,
   normalizeIds,
+  purgedTombstonesOf,
   retainedSessionIds,
+  selectExpiredTombstones,
   selectOrphanedIds,
   sessionDirectoryFromArtifact,
+  upsertPurgedTombstone,
 } from './core.js'
 
 export const name = 'dsh-session-vault'
 export const inject = ['webServer', 'sessionPersistence', 'sessions', 'workspaceRegistry', 'agents', 'storageDomain']
 
 const MAX_BODY_BYTES = 256 * 1024
+/** 清除墓碑的保留期：覆盖 idle checkpoint / teardown drain 等迟到写回的观察窗口。 */
+const TOMBSTONE_RETAIN_MS = 7 * 24 * 60 * 60 * 1000
+
 const trashEntrySchema = z.object({
   sessionId: z.string(),
   title: z.string(),
@@ -50,12 +57,19 @@ const trashEntrySchema = z.object({
   wasArchived: z.boolean(),
 })
 
+const purgedTombstoneSchema = z.object({
+  sessionId: z.string(),
+  originalPath: z.string(),
+  purgedAt: z.number(),
+})
+
 const vaultDomainSpec = defineDomain({
   name: 'dsh_session_vault',
   version: 1,
   global: {
-    schema: z.object({ entries: z.array(trashEntrySchema) }),
-    initial: { entries: [] },
+    // purged 为可选字段：v0.1.7 及之前的状态文件没有它，域版本不变即可兼容读取。
+    schema: z.object({ entries: z.array(trashEntrySchema), purged: z.array(purgedTombstoneSchema).optional() }),
+    initial: { entries: [], purged: [] },
   },
   tables: {},
 })
@@ -194,14 +208,50 @@ function projectionCache(ctx: Context): ProjectionCacheDomain | undefined {
   return ctx.storageDomain.get('session_projcache') as unknown as ProjectionCacheDomain | undefined
 }
 
+/**
+ * 把持久化层的全部打开写入句柄当场冲刷落盘（尽力而为）。
+ *
+ * DSH 0.2 的 jsonl 写入器按 header（cwd+id）推导落盘路径：批量窗口、
+ * `session/flush`（idle checkpoint / teardown drain）以及句柄关闭
+ * （session/disposed → writer.close()，异步且不被任何调用方等待）都会
+ * `mkdir + 写`把目录重新 materialize 回原位——即使它已被移入回收站或清除。
+ * 其中「materialized=false 的句柄在之后任意一次 flush 时写回」没有时限，
+ * 任何清除后的限时轮询守卫都等不到它。
+ *
+ * 在移动/驱逐**之前**调用 flushAll，可以把该会话的在途事件与未落盘头
+ * 当场冲到原位并置 materialized=true；随后的 rename/删除把这份落盘结果
+ * 一并带走，之后所有 flush 直接短路，写回源头被确定性消除。flushAll 失败
+ * 只降级为旧的守卫+墓碑兜底，绝不阻断事务。
+ */
+async function flushPersistence(ctx: Context): Promise<void> {
+  const service = ctx.sessionPersistence as unknown as { flushAll?: () => Promise<void> }
+  if (typeof service.flushAll !== 'function') return
+  try {
+    await service.flushAll()
+  } catch (error) {
+    ctx.logger.warn('[dsh-session-vault] 清除前的持久化冲刷未完成，降级为守卫+墓碑兜底', error)
+  }
+}
+
+interface VaultDomain {
+  global: {
+    get(): unknown
+    set(value: unknown): Promise<void>
+  }
+}
+
 function entriesOf(domain: { global: { get(): unknown } }): TrashEntry[] {
   const value = domain.global.get() as { entries?: TrashEntry[] }
   return Array.isArray(value.entries) ? value.entries : []
 }
 
-async function saveEntries(domain: { global: { set(value: unknown): Promise<void> } }, entries: TrashEntry[]): Promise<void> {
+function purgedOf(domain: { global: { get(): unknown } }): PurgedTombstone[] {
+  return purgedTombstonesOf(domain.global.get())
+}
+
+async function saveDomainState(domain: VaultDomain, entries: TrashEntry[], purged: PurgedTombstone[]): Promise<void> {
   assertUniqueTrashPaths(entries)
-  await domain.global.set({ entries })
+  await domain.global.set({ entries, purged })
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -319,7 +369,7 @@ function persistenceHeaders(snapshots: readonly unknown[]): SessionHeader[] {
   )
 }
 
-async function listSnapshot(ctx: Context, domain: { global: { get(): unknown } }): Promise<SessionVaultSnapshot> {
+async function listSnapshot(ctx: Context, domain: VaultDomain): Promise<SessionVaultSnapshot> {
   const headers = persistenceHeaders(await ctx.sessionPersistence.list())
   const known = new Set<string>(headers.map((header) => String(header.id)))
 
@@ -330,6 +380,14 @@ async function listSnapshot(ctx: Context, domain: { global: { get(): unknown } }
     await reconcileOrphanedState(ctx, known, domain)
   } catch (error) {
     ctx.logger.warn('[dsh-session-vault] 读取快照时的孤儿对账未完成', error)
+  }
+
+  // 每次快照顺带巡检清除墓碑：迟到的写入器复活副本在用户打开保险库时即被
+  // 清理并重新遮蔽，而不是以「未分组」会话的身份留在侧边栏里。
+  try {
+    await sweepPurgedTombstones(ctx, domain)
+  } catch (error) {
+    ctx.logger.warn('[dsh-session-vault] 读取快照时的清除墓碑巡检未完成', error)
   }
 
   const archived = new Set(ctx.workspaceRegistry.archivedSessionIds.map(String))
@@ -406,6 +464,47 @@ async function setArchived(ctx: Context, sessionId: string, archived: boolean): 
   })
 }
 
+/**
+ * 巡检清除墓碑：清掉迟到的写入器复活副本，并让过期墓碑退役。
+ *
+ * 永久清除解除归档遮蔽后，任何迟到写回原位的副本都会以「未分组」形式出现在
+ * 侧边栏（宿主列表 = 磁盘扫描 ∪ 内存 live 会话）。前置冲刷消除了已知写回源，
+ * 但冲刷失败、宿主行为变化等残余风险仍在——墓碑让这些副本在启动时和每次
+ * 读取快照时被发现：物理删除、重新遮蔽（隐藏幽灵）、刷新观察期。原位连续
+ * 7 天无复活的墓碑才允许退役。
+ */
+async function sweepPurgedTombstones(ctx: Context, domain: VaultDomain): Promise<void> {
+  const purged = purgedOf(domain)
+  if (purged.length === 0) return
+  const now = Date.now()
+  const resurrected = new Set<string>()
+
+  for (const tombstone of purged) {
+    if (!isPathInside(sessionsRoot(), tombstone.originalPath)) continue
+    if (!existsSync(tombstone.originalPath)) continue
+    resurrected.add(tombstone.sessionId)
+    try {
+      await rm(tombstone.originalPath, { recursive: true, force: true, maxRetries: 3 })
+      await setArchived(ctx, tombstone.sessionId, true)
+      const cache = projectionCache(ctx)
+      if (cache !== undefined) await cache.table('sessions').delete(tombstone.sessionId)
+      ctx.logger.warn(`[dsh-session-vault] 已清除迟到的写入器复活副本并重新遮蔽：${tombstone.sessionId}`)
+    } catch (error) {
+      ctx.logger.warn(`[dsh-session-vault] 清除复活副本失败，保留墓碑继续观察：${tombstone.sessionId}`, error)
+    }
+  }
+
+  let next = purged
+  if (resurrected.size > 0) {
+    next = next.map((tombstone) => resurrected.has(tombstone.sessionId) ? { ...tombstone, purgedAt: now } : tombstone)
+  }
+  const expired = new Set(selectExpiredTombstones(next, resurrected, now, TOMBSTONE_RETAIN_MS))
+  if (expired.size > 0) {
+    next = next.filter((tombstone) => !expired.has(tombstone.sessionId))
+  }
+  if (next !== purged) await saveDomainState(domain, entriesOf(domain), next)
+}
+
 async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPath: string, originalDir: string | undefined): Promise<void> {
   if (!isPathInside(purgingRoot(), stagedPath)) {
     throw Object.assign(new Error('待清除目录未通过安全校验'), { code: 'unsafe-purging-path', status: 500 })
@@ -415,14 +514,18 @@ async function finalizeCommittedPurge(ctx: Context, sessionId: string, stagedPat
   // 仍会把已移出工作区的 live 会话显示到「未分组」。释放失败不得继续清理。
   // 保留空的隔离目录作为重试标记，直到文件、工作区和缓存全部处理完成。
   await mkdir(stagedPath, { recursive: true })
+  // 必须在驱逐之前冲刷：session/disposed 触发的 writer.close() 是异步且不被
+  // 等待的 drain+flush，先冲刷可让句柄缓冲清空、materialized 置位，驱逐后的
+  // 关闭不再有任何内容可写回原位。
+  await flushPersistence(ctx)
   evictLiveSession(ctx, sessionId)
   for (const child of await readdir(stagedPath)) {
     await rm(join(stagedPath, child), { recursive: true, force: true, maxRetries: 3 })
   }
 
-  // 会话写入器按 header（cwd+id）推导路径且关闭时补落盘：回收站期间若有
-  // 在途 flush 把记录写回了原位，此处必须等到原位副本确实消失，才能解除
-  // 归档遮蔽；否则清除完成后「未分组」里会出现同名会话（复活）。
+  // 会话写入器按 header（cwd+id）推导路径且关闭时补落盘：前置冲刷后这里的
+  // 轮询删除的是「已经落地」的副本（确定性），窗口仅兜底吸收残余竞态；
+  // 重试耗尽仍存在时抛错，由调用方保留归档遮蔽走重试路径。
   if (originalDir !== undefined && isPathInside(sessionsRoot(), originalDir)) {
     await ensureDirectoryAbsent(originalDir)
   }
@@ -594,6 +697,10 @@ async function moveToTrash(ctx: Context, domain: { global: { get(): unknown; set
     throw Object.assign(new Error('回收站中已存在同名目录，请先检查数据'), { code: 'trash-collision', status: 409 })
   }
 
+  // rename 前先冲刷：把写入器的在途事件与未落盘句柄当场冲到原位（随 rename
+  // 一并进回收站）并置 materialized，杜绝回收站期间任意时刻的写回复活。
+  await flushPersistence(ctx)
+
   let moved = false
   let archiveChanged = false
   try {
@@ -601,7 +708,8 @@ async function moveToTrash(ctx: Context, domain: { global: { get(): unknown; set
     archiveChanged = !wasArchived
     await rename(originalPath, trashPath)
     moved = true
-    await saveEntries(domain, [...existing, entry])
+    // 会话重新进入插件托管，同名旧墓碑（若有）随之退役，避免巡检误删恢复数据。
+    await saveDomainState(domain, [...existing, entry], purgedOf(domain).filter((tombstone) => tombstone.sessionId !== sessionId))
     // 写入器的 200ms 批量落盘窗口可能在 rename 后把记录写回原位；尽力清理，
     // 残留副本交由永久清除的原位守卫兜底（此处失败不影响回收站事务）。
     try {
@@ -639,7 +747,9 @@ async function restoreTrash(ctx: Context, domain: { global: { get(): unknown; se
   await rename(entry.trashPath, entry.originalPath)
   try {
     await setArchived(ctx, sessionId, entry.wasArchived)
-    await saveEntries(domain, entries.filter((candidate) => candidate.sessionId !== sessionId))
+    // 恢复成功的会话重新归用户所有，同名旧墓碑（若有）必须退役，否则巡检会把
+    // 刚恢复的记录当复活副本删掉。
+    await saveDomainState(domain, entries.filter((candidate) => candidate.sessionId !== sessionId), purgedOf(domain).filter((tombstone) => tombstone.sessionId !== sessionId))
   } catch (error) {
     await rename(entry.originalPath, entry.trashPath).catch(() => {})
     await setArchived(ctx, sessionId, true).catch(() => {})
@@ -673,7 +783,14 @@ async function purgeTrash(ctx: Context, domain: { global: { get(): unknown; set(
     staged = true
   }
   try {
-    await saveEntries(domain, entries.filter((candidate) => candidate.sessionId !== sessionId))
+    // 条目删除与墓碑登记放进同一次全局写入：状态要么同时落定、要么同时回滚。
+    // 墓碑保证清除提交后原位再出现的任何副本都会被巡检删除并重新遮蔽。
+    const purgedNext = upsertPurgedTombstone(purgedOf(domain), {
+      sessionId,
+      originalPath: entry.originalPath,
+      purgedAt: Date.now(),
+    })
+    await saveDomainState(domain, entries.filter((candidate) => candidate.sessionId !== sessionId), purgedNext)
   } catch (error) {
     if (staged && existsSync(stagedPath) && !existsSync(entry.trashPath)) {
       await rename(stagedPath, entry.trashPath).catch(() => {})
@@ -722,6 +839,13 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
     // 对账属于尽力而为的清理：读不到会话列表或当前 DSH 未暴露状态原语时保持原样，
     // 留待下次读取快照或下次启动时重试，绝不因此让插件加载失败。
     ctx.logger.warn('[dsh-session-vault] 启动时的孤儿对账未完成，稍后重试', error)
+  }
+  try {
+    // 上次运行退出（teardown drain）可能把已清除会话写回原位：必须在 web UI
+    // 能列出会话之前清掉并重新遮蔽，否则用户一启动就会看到「未分组」幽灵。
+    await sweepPurgedTombstones(ctx, domain)
+  } catch (error) {
+    ctx.logger.warn('[dsh-session-vault] 启动时的清除墓碑巡检未完成，稍后重试', error)
   }
 
   const unregister = ctx.webServer.register({

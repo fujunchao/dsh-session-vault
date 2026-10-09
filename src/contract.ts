@@ -23,6 +23,13 @@ export interface TrashEntry {
   wasArchived: boolean
 }
 
+/** 永久清除的墓碑：清除提交后仍需观察原位一段时间，迟到的写入器副本由巡检清除。 */
+export interface PurgedTombstone {
+  sessionId: string
+  originalPath: string
+  purgedAt: number
+}
+
 export interface SessionVaultSnapshot {
   sessions: SessionVaultRow[]
   trash: TrashEntry[]

@@ -55,4 +55,39 @@ export declare function selectOrphanedIds(stored: readonly string[], known: Read
  * 它；若对账把这些标识判为孤儿清掉，该遮蔽立即失效，会话会重新冒到侧边栏中。
  */
 export declare function retainedSessionIds(existing: Iterable<string>, trashed: Iterable<string>): Set<string>;
+/**
+ * 从域全局状态中读出清除墓碑列表（容忍旧版本数据缺 purged 字段）。
+ */
+export declare function purgedTombstonesOf(value: unknown): Array<{
+    sessionId: string;
+    originalPath: string;
+    purgedAt: number;
+}>;
+/**
+ * 插入或刷新一枚清除墓碑（同一会话只保留最新一枚）。
+ */
+export declare function upsertPurgedTombstone(purged: ReadonlyArray<{
+    sessionId: string;
+    originalPath: string;
+    purgedAt: number;
+}>, tombstone: {
+    sessionId: string;
+    originalPath: string;
+    purgedAt: number;
+}): Array<{
+    sessionId: string;
+    originalPath: string;
+    purgedAt: number;
+}>;
+/**
+ * 挑出可以过期移除的墓碑：原位已无副本且距上次清除超过保留期。
+ *
+ * `resurrected` 之外且未过期的墓碑必须保留——写入器（idle checkpoint、
+ * teardown drain）可能在清除完成后很久才把工件写回原位，墓碑是唯一的
+ * 事后清理与重新遮蔽依据。
+ */
+export declare function selectExpiredTombstones(purged: ReadonlyArray<{
+    sessionId: string;
+    purgedAt: number;
+}>, resurrected: ReadonlySet<string>, now: number, retainMs: number): string[];
 //# sourceMappingURL=core.d.ts.map

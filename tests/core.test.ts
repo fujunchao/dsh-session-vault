@@ -11,9 +11,12 @@ import {
   ensureDirectoryAbsent,
   isSessionId,
   normalizeIds,
+  purgedTombstonesOf,
   retainedSessionIds,
+  selectExpiredTombstones,
   selectOrphanedIds,
   sessionDirectoryFromArtifact,
+  upsertPurgedTombstone,
 } from '../src/core.js'
 
 describe('会话标识校验', () => {
@@ -40,9 +43,11 @@ describe('文件系统围栏', () => {
   })
 
   it('从记录文件安全解析会话目录', () => {
-    expect(sessionDirectoryFromArtifact('/home/u/.dsh/sessions', '/home/u/.dsh/sessions/p/session-a/session.jsonl.zstd'))
-      .toBe('/home/u/.dsh/sessions/p/session-a')
-    expect(() => sessionDirectoryFromArtifact('/home/u/.dsh/sessions', '/tmp/session.jsonl')).toThrow()
+    // 用平台原生分隔符构造输入，保证断言在 Windows 与 POSIX 开发环境下都成立。
+    const root = join(tmpdir(), 'dsh-sessions-root')
+    expect(sessionDirectoryFromArtifact(root, join(root, 'p', 'session-a', 'session.v4.jsonl.zstd')))
+      .toBe(join(root, 'p', 'session-a'))
+    expect(() => sessionDirectoryFromArtifact(root, join(tmpdir(), 'outside', 'session.jsonl'))).toThrow()
   })
 })
 
@@ -157,5 +162,41 @@ describe('ensureDirectoryAbsent 原位守卫', () => {
     } finally {
       clearInterval(recreator)
     }
+  })
+})
+
+describe('清除墓碑', () => {
+  it('容忍旧版本状态（无 purged 字段）与畸形数据', () => {
+    // v0.1.7 的域全局只有 entries；升级后首次读取必须得到空墓碑而不是报错。
+    expect(purgedTombstonesOf({ entries: [] })).toEqual([])
+    expect(purgedTombstonesOf(null)).toEqual([])
+    expect(purgedTombstonesOf({ purged: 'x' })).toEqual([])
+    expect(purgedTombstonesOf({ purged: [{ sessionId: 'a' }, null, 3] })).toEqual([])
+  })
+
+  it('读出合法墓碑', () => {
+    const value = { entries: [], purged: [{ sessionId: 'session-a', originalPath: '/s/p/session-a', purgedAt: 1 }] }
+    expect(purgedTombstonesOf(value)).toEqual([{ sessionId: 'session-a', originalPath: '/s/p/session-a', purgedAt: 1 }])
+  })
+
+  it('同一会话只保留最新墓碑', () => {
+    const purged = upsertPurgedTombstone(
+      [{ sessionId: 'session-a', originalPath: '/s/p/session-a', purgedAt: 1 }],
+      { sessionId: 'session-a', originalPath: '/s/p/session-a', purgedAt: 2 },
+    )
+    expect(purged).toEqual([{ sessionId: 'session-a', originalPath: '/s/p/session-a', purgedAt: 2 }])
+  })
+
+  it('原位复活的墓碑不过期、观察期未满的不过期', () => {
+    const now = 10_000_000
+    const retainMs = 604_800_000
+    const purged = [
+      { sessionId: 'session-gone', originalPath: '/s/p/gone', purgedAt: now - retainMs - 1 },
+      { sessionId: 'session-back', originalPath: '/s/p/back', purgedAt: now - retainMs - 1 },
+      { sessionId: 'session-new', originalPath: '/s/p/new', purgedAt: now },
+    ]
+    // session-back 虽已过保留期但原位仍有复活副本，必须继续观察。
+    const expired = selectExpiredTombstones(purged, new Set(['session-back']), now, retainMs)
+    expect(expired).toEqual(['session-gone'])
   })
 })

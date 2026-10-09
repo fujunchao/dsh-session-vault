@@ -164,3 +164,47 @@ export function retainedSessionIds(existing: Iterable<string>, trashed: Iterable
   for (const id of trashed) retained.add(id)
   return retained
 }
+
+/**
+ * 从域全局状态中读出清除墓碑列表（容忍旧版本数据缺 purged 字段）。
+ */
+export function purgedTombstonesOf(value: unknown): Array<{ sessionId: string; originalPath: string; purgedAt: number }> {
+  if (value === null || typeof value !== 'object') return []
+  const purged = (value as { purged?: unknown }).purged
+  return Array.isArray(purged)
+    ? purged.filter((entry): entry is { sessionId: string; originalPath: string; purgedAt: number } =>
+        entry !== null && typeof entry === 'object'
+          && typeof (entry as { sessionId?: unknown }).sessionId === 'string'
+          && typeof (entry as { originalPath?: unknown }).originalPath === 'string'
+          && typeof (entry as { purgedAt?: unknown }).purgedAt === 'number',
+      )
+    : []
+}
+
+/**
+ * 插入或刷新一枚清除墓碑（同一会话只保留最新一枚）。
+ */
+export function upsertPurgedTombstone(
+  purged: ReadonlyArray<{ sessionId: string; originalPath: string; purgedAt: number }>,
+  tombstone: { sessionId: string; originalPath: string; purgedAt: number },
+): Array<{ sessionId: string; originalPath: string; purgedAt: number }> {
+  return [...purged.filter((entry) => entry.sessionId !== tombstone.sessionId), tombstone]
+}
+
+/**
+ * 挑出可以过期移除的墓碑：原位已无副本且距上次清除超过保留期。
+ *
+ * `resurrected` 之外且未过期的墓碑必须保留——写入器（idle checkpoint、
+ * teardown drain）可能在清除完成后很久才把工件写回原位，墓碑是唯一的
+ * 事后清理与重新遮蔽依据。
+ */
+export function selectExpiredTombstones(
+  purged: ReadonlyArray<{ sessionId: string; purgedAt: number }>,
+  resurrected: ReadonlySet<string>,
+  now: number,
+  retainMs: number,
+): string[] {
+  return purged
+    .filter((entry) => !resurrected.has(entry.sessionId) && now - entry.purgedAt > retainMs)
+    .map((entry) => entry.sessionId)
+}
